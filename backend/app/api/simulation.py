@@ -2893,10 +2893,14 @@ def delete_simulation(simulation_id: str):
             "error": t('api.simDeleteRunStateCorrupt', id=simulation_id),
         }), 409
 
-    probe = SimulationRunner.probe_orphan_process(simulation_id)
+    # 进程检查与 run_state 里的状态无关：_terminate_process() 只等组长退出
+    # 就把状态写成 STOPPED，子孙可能还活着并继续写模拟目录。因此只要曾经
+    # 持久化过 process_pid，无论 RUNNING 还是 COMPLETED/STOPPED/FAILED，
+    # 都必须做一次进程组归属检查。
+    probe = SimulationRunner.orphan_status(simulation_id)
 
-    # 存在一个进程但无法确认身份：既不能删目录（它可能还在写），
-    # 也不能 killpg（可能杀掉复用了该 PID 的无关进程）。
+    # 有活进程但无法确认归属：既不能删目录（它可能还在写），
+    # 也不能 killpg（可能杀掉复用了该 PGID 的无关进程组）。
     if probe == SimulationRunner.PID_UNKNOWN:
         return jsonify({
             "success": False,
@@ -2921,29 +2925,23 @@ def delete_simulation(simulation_id: str):
         except Exception as e:
             logger.warning(f"stop_simulation failed for {simulation_id}: {e}")
 
-        # stop_simulation 只认 _processes 里的 Popen 句柄。Flask 崩溃重启后
-        # 那个缓存是空的，而子进程用 start_new_session=True 启动，还活着。
-        # 用持久化的 PID 收尾，否则会在活着的进程脚下删目录。
-        #
-        # 这里必须重新看三态，不能用布尔的 has_live_process()：它把
-        # PID_UNKNOWN 也折叠成 False，等于「没有进程」，会放行删除。
-        after = SimulationRunner.probe_orphan_process(simulation_id)
+        # stop_simulation 只认 _processes 里的 Popen 句柄，且只等组长退出。
+        # 重新做一次完整判定：三态必须原样保留，不能折叠成布尔。
+        after = SimulationRunner.orphan_status(simulation_id)
         if after == SimulationRunner.PID_UNKNOWN:
             return jsonify({
                 "success": False,
                 "error_code": "process_unverifiable",
                 "error": t('api.simDeleteProcessUnverifiable', id=simulation_id),
             }), 409
-        # PID_DEAD 只说明组长没了，子孙可能还在写目录；交给 terminate 判断组是否清空。
-        if after in (SimulationRunner.PID_OURS, SimulationRunner.PID_DEAD):
+        if after == SimulationRunner.PID_OURS:
             if not SimulationRunner.terminate_orphan_process(simulation_id):
                 return jsonify({
                     "success": False,
                     "error_code": "process_alive",
                     "error": t('api.simDeleteProcessAlive', id=simulation_id),
                 }), 409
-            # 终止后再确认一次，UNKNOWN 同样拒绝
-            final = SimulationRunner.probe_orphan_process(simulation_id)
+            final = SimulationRunner.orphan_status(simulation_id)
             if final not in (SimulationRunner.PID_DEAD, SimulationRunner.PID_OTHER):
                 return jsonify({
                     "success": False,

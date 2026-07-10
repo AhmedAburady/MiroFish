@@ -352,6 +352,90 @@ class SimulationRunner:
         except Exception:
             return cls.PID_UNKNOWN
 
+    # 进程组归属判定结果
+    GROUP_EMPTY = 'empty'          # 组里没有成员
+    GROUP_OURS = 'ours'            # 至少一个成员被正向确认属于本模拟
+    GROUP_FOREIGN = 'foreign'      # 成员都可读，且都不属于本模拟
+    GROUP_UNKNOWN = 'unknown'      # 有成员，但读不出足以判定归属的信息
+
+    @classmethod
+    def _group_member_pids(cls, pgid: int):
+        """列出进程组成员 PID。返回 None 表示无法枚举（非 Linux 且无 psutil）。"""
+        if os.path.isdir('/proc'):
+            members = []
+            for entry in os.listdir('/proc'):
+                if not entry.isdigit():
+                    continue
+                try:
+                    with open(f'/proc/{entry}/stat', 'r') as f:
+                        raw = f.read()
+                    # comm 字段可能含空格与括号，从最后一个 ')' 之后开始切
+                    fields = raw[raw.rindex(')') + 2:].split()
+                    if int(fields[2]) == pgid:      # state, ppid, pgrp
+                        members.append(int(entry))
+                except Exception:
+                    continue
+            return members
+
+        try:
+            import psutil
+        except ImportError:
+            return None
+        members = []
+        for proc in psutil.process_iter(['pid']):
+            try:
+                if os.getpgid(proc.info['pid']) == pgid:
+                    members.append(proc.info['pid'])
+            except Exception:
+                continue
+        return members
+
+    @classmethod
+    def _verify_group_ownership(cls, pgid: int, simulation_id: str) -> str:
+        """正向确认一个进程组是否属于该模拟。
+
+        不能靠「pgid 等于我们记录的 pid」来推断归属：组空掉之后 PGID 会被回收，
+        之后一个无关的新组可能拿到同一个 PGID，再失去自己的组长，只剩子孙。
+        那时组长探测返回 PID_DEAD，而组仍活着 —— 直接 killpg 就杀错了人。
+
+        所以必须逐个检查组成员：子孙进程继承 cwd，因此凡是 cwd 精确等于
+        <sim_dir> 的成员即可证明这个组是我们的。任何成员信息读不出来，
+        一律返回 GROUP_UNKNOWN 交由调用方拒绝。
+        """
+        members = cls._group_member_pids(pgid)
+        if members is None:
+            return cls.GROUP_UNKNOWN
+        if not members:
+            return cls.GROUP_EMPTY
+
+        sim_dir, _config, _scripts = cls._expected_identity(simulation_id)
+        unreadable = False
+
+        for pid in members:
+            cwd = ''
+            if os.path.isdir(f'/proc/{pid}'):
+                try:
+                    cwd = os.readlink(f'/proc/{pid}/cwd')
+                except Exception:
+                    cwd = ''
+            else:
+                try:
+                    import psutil
+                    cwd = psutil.Process(pid).cwd()
+                except Exception:
+                    cwd = ''
+
+            if not cwd:
+                unreadable = True
+                continue
+            try:
+                if os.path.realpath(cwd) == sim_dir:
+                    return cls.GROUP_OURS
+            except Exception:
+                unreadable = True
+
+        return cls.GROUP_UNKNOWN if unreadable else cls.GROUP_FOREIGN
+
     @staticmethod
     def _process_group_alive(pgid: int) -> bool:
         """进程组里是否还有成员。
@@ -410,18 +494,60 @@ class SimulationRunner:
         return cls.probe_orphan_process(simulation_id) == cls.PID_OURS
 
     @classmethod
-    def terminate_orphan_process(cls, simulation_id: str, timeout: int = 10) -> bool:
-        """终止一个没有 Popen 句柄的遗留进程组。
+    def orphan_status(cls, simulation_id: str) -> str:
+        """删除前的总判定：是否还有属于本模拟的活进程。
 
-        只有在身份被正向确认（PID_OURS）时才发信号。PID_UNKNOWN 一律返回 False，
-        由调用方拒绝删除 —— 宁可删不掉，也不能 killpg 一个陌生进程组。
+        返回 PID_DEAD（可以安全删除）、PID_OURS（需要先终止）、
+        PID_OTHER（PID 已被复用，本模拟的进程组早已清空）、
+        PID_UNKNOWN（无法确认，必须拒绝删除）。
 
-        成功的判据是「整个进程组消失」，而不是「组长 PID 消失」：组长响应
-        SIGTERM 退出后，它的子孙可能还活着并继续写模拟目录。
+        无论 run_state.json 里的状态是 RUNNING 还是 COMPLETED/STOPPED/FAILED，
+        只要持久化了 process_pid 就必须走这条检查：_terminate_process() 只等
+        组长退出就把状态写成 STOPPED，子孙可能还活着。
         """
-        status = cls.probe_orphan_process(simulation_id)
+        process = cls._processes.get(simulation_id)
+        if process is not None and process.poll() is None:
+            return cls.PID_OURS
+
+        state = cls.get_run_state(simulation_id)
+        pid = getattr(state, 'process_pid', None) if state else None
+        if not pid:
+            return cls.PID_DEAD
+
+        leader = cls._probe_pid(pid, simulation_id)
+        if leader == cls.PID_OURS:
+            return cls.PID_OURS
+        if leader == cls.PID_UNKNOWN:
+            return cls.PID_UNKNOWN
+
+        # 组长不在了（DEAD），或该 PID 已被别人占用（OTHER）。
+        # 组长死掉不代表组空了：子孙可能仍在写模拟目录。
+        pgid = pid
+        if not cls._process_group_alive(pgid):
+            return cls.PID_DEAD
+
+        # 组还活着。它到底是不是我们的？必须正向验证，不能靠 pgid 推断。
+        ownership = cls._verify_group_ownership(pgid, simulation_id)
+        if ownership == cls.GROUP_OURS:
+            return cls.PID_OURS
+        if ownership in (cls.GROUP_EMPTY, cls.GROUP_FOREIGN):
+            return cls.PID_DEAD          # 组是空的，或确认属于别人 —— 与我们无关
+        return cls.PID_UNKNOWN           # 读不出来 -> 拒绝删除
+
+    @classmethod
+    def terminate_orphan_process(cls, simulation_id: str, timeout: int = 10) -> bool:
+        """终止属于该模拟的遗留进程组。
+
+        只在归属被正向确认时才发信号。任何不确定都返回 False，由调用方拒绝
+        删除 —— 宁可删不掉，也不能 killpg 一个陌生进程组。
+
+        成功的判据是「整个进程组消失」，而不是「组长 PID 消失」。
+        """
+        status = cls.orphan_status(simulation_id)
+        if status in (cls.PID_DEAD, cls.PID_OTHER):
+            return True
         if status == cls.PID_UNKNOWN:
-            logger.error(f"无法确认 {simulation_id} 的子进程身份，拒绝发送信号")
+            logger.error(f"无法确认 {simulation_id} 的进程归属，拒绝发送信号")
             return False
 
         state = cls.get_run_state(simulation_id)
@@ -429,37 +555,26 @@ class SimulationRunner:
         if not pid:
             return True
 
-        # PID 被复用（PID_OTHER）说明我们的进程组早已清空 —— 进程组 ID 只有在
-        # 组内无成员后才会被回收再分配。此时没有需要终止的东西。
-        if status == cls.PID_OTHER:
-            return True
-
         # 子进程以 start_new_session=True 启动，自成一组，故 pgid == pid。
-        # 组长可能已经退出（PID_DEAD），但它的子孙仍在写模拟目录。
-        # 只要该组还有成员，这个 pgid 就还没被回收，仍然是我们的组。
         pgid = pid
-        if status == cls.PID_DEAD and not cls._process_group_alive(pgid):
-            return True
-
-        if status == cls.PID_OURS:
-            try:
-                actual = os.getpgid(pid)
-            except ProcessLookupError:
-                actual = pgid
-            except Exception as e:
-                logger.error(f"获取进程组失败: {simulation_id}, pid={pid}, error={e}")
-                return False
+        try:
+            actual = os.getpgid(pid)
             if actual != pid:
                 logger.error(
                     f"{simulation_id} 的 pid={pid} 不是进程组组长 (pgid={actual})，拒绝 killpg"
                 )
                 return False
+        except ProcessLookupError:
+            pass                          # 组长已退出，但组仍被验证为我们的
+        except Exception as e:
+            logger.error(f"获取进程组失败: {simulation_id}, pid={pid}, error={e}")
+            return False
 
         for sig, wait in ((signal.SIGTERM, timeout), (signal.SIGKILL, 5)):
             try:
                 os.killpg(pgid, sig)
             except ProcessLookupError:
-                return True                     # 组已经没了
+                return True
             except Exception as e:
                 logger.error(f"killpg 失败: {simulation_id}, pgid={pgid}, error={e}")
                 return False
