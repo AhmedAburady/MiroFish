@@ -324,6 +324,10 @@
   },
   "api": {
     "projectNotFound": "Project not found: {id}",
+    "simDeleteMonitorAlive": "The monitor thread for {id} did not exit within {timeout}s. Deletion was refused because it would recreate the directory. Try again shortly.",
+    "simDeleteHandleCloseFailed": "Failed to close the {stream} handle: {error}",
+    "simDeleteScanUnreadable": "Could not read {path}; treating it as a referrer and refusing to delete shared data.",
+    "simDeleteProcessAlive": "A live simulation process for {id} could not be terminated. Deletion was refused.",
     "simDeleteInvalidId": "Invalid simulation id: {id}",
     "simDeleteNotFound": "Simulation not found: {id}",
     "simDeleteStarting": "Simulation {id} is still starting and cannot be deleted yet. Try again shortly.",

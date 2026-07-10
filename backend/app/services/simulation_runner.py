@@ -228,33 +228,126 @@ class SimulationRunner:
     _graph_memory_enabled: Dict[str, bool] = {}  # simulation_id -> enabled
     
     @classmethod
-    def forget_simulation(cls, simulation_id: str, join_timeout: float = 5.0) -> list:
-        """让 Runner 彻底忘记一个模拟，用于删除前的静默处理。
+    def _pid_matches_simulation(cls, pid: int, simulation_id: str) -> bool:
+        """该 PID 是否真的是这个模拟的子进程（而非 PID 复用后的别人）。
 
-        必须在 rmtree 之前调用：监控线程会调用 _save_run_state()，而后者是
-        os.makedirs(exist_ok=True) + 写文件，会把刚刚删掉的目录再造出来。
+        Linux 下比对 /proc/<pid>/cmdline 与 cwd：子进程的 cwd 是模拟目录，
+        --config 参数里也带着 simulation_id。其它平台退化为 kill(pid, 0)，
+        只能证明进程存在，不能证明身份。
+        """
+        try:
+            os.kill(pid, 0)          # 不发信号，仅探测存在性与权限
+        except (ProcessLookupError, OverflowError, ValueError):
+            return False
+        except PermissionError:
+            return True              # 存在但不属于我们，保守视为存活
 
-        返回警告列表（join 超时、句柄关闭失败等），不抛异常。
+        proc_dir = f'/proc/{pid}'
+        if not os.path.isdir(proc_dir):
+            return True              # 非 Linux：只能确认存在
+
+        try:
+            with open(f'{proc_dir}/cmdline', 'rb') as f:
+                cmdline = f.read().decode('utf-8', 'replace')
+            if simulation_id in cmdline:
+                return True
+        except Exception:
+            pass
+
+        try:
+            if simulation_id in os.path.basename(os.readlink(f'{proc_dir}/cwd')):
+                return True
+        except Exception:
+            pass
+
+        return False                 # 存在，但不是这个模拟 -> PID 已被复用
+
+    @classmethod
+    def has_live_process(cls, simulation_id: str) -> bool:
+        """该模拟是否真的还有活着的子进程。
+
+        进程用 start_new_session=True 启动，所以 Flask 崩溃重启后子进程仍在跑，
+        而新进程的 _processes 缓存是空的。只看缓存会误判为「已死」，进而在活着
+        的子进程脚下把目录删掉。必须回退到 run_state.json 里持久化的 PID。
+        """
+        process = cls._processes.get(simulation_id)
+        if process is not None and process.poll() is None:
+            return True
+
+        state = cls.get_run_state(simulation_id)
+        pid = getattr(state, 'process_pid', None) if state else None
+        if not pid:
+            return False
+        return cls._pid_matches_simulation(pid, simulation_id)
+
+    @classmethod
+    def terminate_orphan_process(cls, simulation_id: str, timeout: int = 10) -> bool:
+        """按持久化的 PID 终止一个没有 Popen 句柄的遗留进程组。
+
+        返回是否确认已终止。
+        """
+        state = cls.get_run_state(simulation_id)
+        pid = getattr(state, 'process_pid', None) if state else None
+        if not pid or not cls._pid_matches_simulation(pid, simulation_id):
+            return True
+
+        try:
+            pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            return True
+        except Exception as e:
+            logger.error(f"获取进程组失败: {simulation_id}, pid={pid}, error={e}")
+            return False
+
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(pgid, sig)
+            except ProcessLookupError:
+                return True
+            except Exception as e:
+                logger.error(f"killpg 失败: {simulation_id}, pgid={pgid}, error={e}")
+                return False
+
+            deadline = time.time() + (timeout if sig is signal.SIGTERM else 3)
+            while time.time() < deadline:
+                if not cls._pid_matches_simulation(pid, simulation_id):
+                    return True
+                time.sleep(0.2)
+
+        return not cls._pid_matches_simulation(pid, simulation_id)
+
+    @classmethod
+    def forget_simulation(cls, simulation_id: str, join_timeout: float = 5.0):
+        """让 Runner 忘记一个模拟。删除目录前必须先调用且必须成功。
+
+        监控线程会调用 _save_run_state()，那是 makedirs(exist_ok=True) 加写文件，
+        会把刚删掉的目录重建出来。因此线程没退出就绝不能删目录：此时保留线程
+        注册，返回 ok=False，让调用方拒绝本次删除并允许稍后重试。
+
+        Returns:
+            (ok, warnings)  warnings 是 [{'code': str, ...params}]，
+            由 API 层本地化，Runner 不产出面向用户的文案。
         """
         warnings = []
 
-        # 先等监控线程退出，它是唯一会写 run_state.json 的后台线程
-        thread = cls._monitor_threads.pop(simulation_id, None)
+        thread = cls._monitor_threads.get(simulation_id)
         if thread and thread.is_alive():
             thread.join(timeout=join_timeout)
             if thread.is_alive():
-                warnings.append(
-                    f"监控线程在 {join_timeout}s 内未退出: {simulation_id}，"
-                    f"它可能会重建已删除的目录"
-                )
+                # 注意：线程仍留在 _monitor_threads 里，重试时可以再次 join
+                return False, [{'code': 'monitor_alive',
+                                'id': simulation_id,
+                                'timeout': join_timeout}]
+        cls._monitor_threads.pop(simulation_id, None)
 
-        for name, handles in (('stdout', cls._stdout_files), ('stderr', cls._stderr_files)):
+        for stream, handles in (('stdout', cls._stdout_files), ('stderr', cls._stderr_files)):
             fh = handles.pop(simulation_id, None)
             if fh:
                 try:
                     fh.close()
                 except Exception as e:
-                    warnings.append(f"关闭 {name} 句柄失败: {e}")
+                    warnings.append({'code': 'handle_close_failed',
+                                     'stream': stream, 'error': str(e)})
 
         # 清掉所有按 simulation_id 索引的缓存，否则 /run-status 会返回
         # 已删除模拟的陈旧数据，直到进程重启
@@ -263,17 +356,7 @@ class SimulationRunner:
         cls._action_queues.pop(simulation_id, None)
         cls._graph_memory_enabled.pop(simulation_id, None)
 
-        return warnings
-
-    @classmethod
-    def has_live_process(cls, simulation_id: str) -> bool:
-        """该模拟是否真的还有一个活着的子进程。
-
-        run_state.json 里的 STARTING 可能是上次进程被强杀留下的残留状态，
-        此时 _processes 是空的，不能据此永远拒绝删除。
-        """
-        process = cls._processes.get(simulation_id)
-        return process is not None and process.poll() is None
+        return True, warnings
 
     @classmethod
     def get_run_state(cls, simulation_id: str) -> Optional[SimulationRunState]:

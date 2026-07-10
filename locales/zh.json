@@ -324,6 +324,10 @@
   },
   "api": {
     "projectNotFound": "项目不存在: {id}",
+    "simDeleteMonitorAlive": "{id} 的监控线程在 {timeout}s 内未退出，它会重建被删除的目录，已拒绝本次删除。请稍后重试。",
+    "simDeleteHandleCloseFailed": "关闭 {stream} 句柄失败: {error}",
+    "simDeleteScanUnreadable": "无法读取 {path}，已保守地视其为引用者并拒绝删除共享数据。",
+    "simDeleteProcessAlive": "{id} 仍有无法终止的模拟进程，已拒绝本次删除。",
     "simDeleteInvalidId": "非法的模拟ID: {id}",
     "simDeleteNotFound": "模拟不存在: {id}",
     "simDeleteStarting": "模拟 {id} 正在启动中，暂时无法删除，请稍后重试。",

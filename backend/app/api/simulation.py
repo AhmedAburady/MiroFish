@@ -2754,7 +2754,11 @@ def _resolve_simulation_dir(simulation_id: str) -> str:
 
 
 def _iter_state_files():
-    """遍历所有模拟的 state.json，产出 (simulation_id, data)。"""
+    """遍历所有模拟的 state.json，产出 (simulation_id, data_or_None)。
+
+    读不出来的记录产出 None：引用扫描是破坏性操作的前置检查，
+    必须 fail closed —— 一个半写入的 state.json 里可能正藏着引用者。
+    """
     import json as _json
     sims_root = Config.OASIS_SIMULATION_DATA_DIR
     if not os.path.isdir(sims_root):
@@ -2767,7 +2771,7 @@ def _iter_state_files():
             with open(state_path, 'r', encoding='utf-8') as f:
                 yield sid, _json.load(f)
         except Exception:
-            continue
+            yield sid, None
 
 
 def _graph_referrers(graph_id: str, exclude_simulation_id: str,
@@ -2783,7 +2787,9 @@ def _graph_referrers(graph_id: str, exclude_simulation_id: str,
     for sid, data in _iter_state_files():
         if sid == exclude_simulation_id:
             continue
-        if data.get('graph_id') == graph_id:
+        if data is None:
+            referrers.append(f'unreadable:simulation:{sid}')
+        elif data.get('graph_id') == graph_id:
             referrers.append(f'simulation:{sid}')
 
     # 直接扫描目录，不用 ProjectManager.list_projects()：它默认只返回 50 条。
@@ -2800,7 +2806,8 @@ def _graph_referrers(graph_id: str, exclude_simulation_id: str,
                     if _json.load(f).get('graph_id') == graph_id:
                         referrers.append(f'project:{pid}')
             except Exception:
-                continue
+                # 读不出来就当它引用着，宁可不删也不误删共享数据
+                referrers.append(f'unreadable:project:{pid}')
 
     return referrers
 
@@ -2810,11 +2817,15 @@ def _project_referrers(project_id: str, exclude_simulation_id: str) -> list:
 
     报告生成等操作要读项目，删掉项目会让所有兄弟模拟失效。
     """
-    return [
-        f'simulation:{sid}'
-        for sid, data in _iter_state_files()
-        if sid != exclude_simulation_id and data.get('project_id') == project_id
-    ]
+    referrers = []
+    for sid, data in _iter_state_files():
+        if sid == exclude_simulation_id:
+            continue
+        if data is None:
+            referrers.append(f'unreadable:simulation:{sid}')
+        elif data.get('project_id') == project_id:
+            referrers.append(f'simulation:{sid}')
+    return referrers
 
 
 @simulation_bp.route('/<simulation_id>', methods=['DELETE'])
@@ -2872,7 +2883,9 @@ def delete_simulation(simulation_id: str):
 
     # STARTING 只有在确实存在活着的子进程时才拒绝删除；否则那是上次进程被
     # 强杀留下的残留状态，永远拒绝会让这个模拟再也删不掉。
-    if status == RunnerStatus.STARTING and SimulationRunner.has_live_process(simulation_id):
+    live = SimulationRunner.has_live_process(simulation_id)
+
+    if status == RunnerStatus.STARTING and live:
         return jsonify({
             "success": False,
             "error_code": "starting",
@@ -2880,22 +2893,46 @@ def delete_simulation(simulation_id: str):
             "runner_status": str(status),
         }), 409
 
-    if status in (RunnerStatus.RUNNING, RunnerStatus.PAUSED) or (
-        status == RunnerStatus.STARTING and SimulationRunner.has_live_process(simulation_id)
-    ):
+    if live or status in (RunnerStatus.RUNNING, RunnerStatus.PAUSED):
         try:
             logger.info(f"Stopping simulation before deletion: {simulation_id}")
             SimulationRunner.stop_simulation(simulation_id)
         except Exception as e:
-            return jsonify({
-                "success": False,
-                "error_code": "stop_failed",
-                "error": t('api.simDeleteStopFailed', error=str(e)),
-            }), 409
+            logger.warning(f"stop_simulation failed for {simulation_id}: {e}")
 
-    # 2. 让 Runner 忘掉它：监控线程会 _save_run_state()，那是
-    #    makedirs(exist_ok=True) + 写文件，会把刚删掉的目录重建出来。
-    warnings.extend(SimulationRunner.forget_simulation(simulation_id))
+        # stop_simulation 只认 _processes 里的 Popen 句柄。Flask 崩溃重启后
+        # 那个缓存是空的，而子进程用 start_new_session=True 启动，还活着。
+        # 用持久化的 PID 收尾，否则会在活着的进程脚下删目录。
+        if SimulationRunner.has_live_process(simulation_id):
+            if not SimulationRunner.terminate_orphan_process(simulation_id):
+                return jsonify({
+                    "success": False,
+                    "error_code": "process_alive",
+                    "error": t('api.simDeleteProcessAlive', id=simulation_id),
+                }), 409
+
+    # 2. 让 Runner 忘掉它。监控线程会 _save_run_state()，那是
+    #    makedirs(exist_ok=True) + 写文件，会把刚删掉的目录重建出来，
+    #    所以线程没退出就必须拒绝删除，而不是仅仅记一条警告。
+    forgotten, runner_warnings = SimulationRunner.forget_simulation(simulation_id)
+    for w in runner_warnings:
+        code = w.pop('code')
+        if code == 'monitor_alive':
+            warnings.append(t('api.simDeleteMonitorAlive', **w))
+        elif code == 'handle_close_failed':
+            warnings.append(t('api.simDeleteHandleCloseFailed', **w))
+        else:
+            warnings.append(str(w))
+
+    if not forgotten:
+        # warnings 里已经有本地化好的 monitor_alive 文案
+        return jsonify({
+            "success": False,
+            "error_code": "monitor_alive",
+            "error": warnings[-1] if warnings else t('api.simDeleteMonitorAlive',
+                                                     id=simulation_id, timeout=5.0),
+            "warnings": warnings,
+        }), 409
 
     # 3. 目录删除后就拿不到 graph_id / project_id 了，先读出来
     graph_id = None
