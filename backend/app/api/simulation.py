@@ -2924,8 +2924,26 @@ def delete_simulation(simulation_id: str):
         # stop_simulation 只认 _processes 里的 Popen 句柄。Flask 崩溃重启后
         # 那个缓存是空的，而子进程用 start_new_session=True 启动，还活着。
         # 用持久化的 PID 收尾，否则会在活着的进程脚下删目录。
-        if SimulationRunner.has_live_process(simulation_id):
+        #
+        # 这里必须重新看三态，不能用布尔的 has_live_process()：它把
+        # PID_UNKNOWN 也折叠成 False，等于「没有进程」，会放行删除。
+        after = SimulationRunner.probe_orphan_process(simulation_id)
+        if after == SimulationRunner.PID_UNKNOWN:
+            return jsonify({
+                "success": False,
+                "error_code": "process_unverifiable",
+                "error": t('api.simDeleteProcessUnverifiable', id=simulation_id),
+            }), 409
+        if after == SimulationRunner.PID_OURS:
             if not SimulationRunner.terminate_orphan_process(simulation_id):
+                return jsonify({
+                    "success": False,
+                    "error_code": "process_alive",
+                    "error": t('api.simDeleteProcessAlive', id=simulation_id),
+                }), 409
+            # 终止后再确认一次，UNKNOWN 同样拒绝
+            final = SimulationRunner.probe_orphan_process(simulation_id)
+            if final not in (SimulationRunner.PID_DEAD, SimulationRunner.PID_OTHER):
                 return jsonify({
                     "success": False,
                     "error_code": "process_alive",

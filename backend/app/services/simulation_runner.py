@@ -234,12 +234,51 @@ class SimulationRunner:
     PID_UNKNOWN = 'unknown'  # 存在，但无法确认身份 —— 绝不能对它发信号
 
     @classmethod
+    def _expected_identity(cls, simulation_id: str):
+        """该模拟子进程应有的 cwd 与 --config 绝对路径。"""
+        sim_dir = os.path.realpath(os.path.join(cls.RUN_STATE_DIR, simulation_id))
+        config_path = os.path.realpath(os.path.join(sim_dir, "simulation_config.json"))
+        return sim_dir, config_path
+
+    @classmethod
+    def _identify_argv(cls, argv, cwd, simulation_id: str) -> str:
+        """按精确路径比对判断进程身份，返回 PID_*。
+
+        不能用子串匹配：任何在模拟目录下运行的进程（例如
+        `tail sim_xxx/simulation.log`）命令行里都含有 simulation_id，
+        会被误判成 OASIS 子进程，进而被 killpg。
+        子进程的启动方式是固定的：
+            cwd = <sim_dir>
+            argv = [python, run_*_simulation.py, "--config", <sim_dir>/simulation_config.json]
+        所以要求 argv 里出现精确的 config 绝对路径。
+        """
+        sim_dir, config_path = cls._expected_identity(simulation_id)
+
+        if not argv:
+            # 拿不到命令行就无法正向确认身份，cwd 单独不足以区分
+            return cls.PID_UNKNOWN
+
+        argv_ok = any(
+            os.path.realpath(a) == config_path
+            for a in argv
+            if isinstance(a, str) and a.endswith('.json')
+        )
+        if not argv_ok:
+            return cls.PID_OTHER
+
+        # 命令行匹配了，若 cwd 可读则必须同样精确匹配
+        if cwd and os.path.realpath(cwd) != sim_dir:
+            return cls.PID_OTHER
+
+        return cls.PID_OURS
+
+    @classmethod
     def _probe_pid(cls, pid: int, simulation_id: str) -> str:
         """判断 pid 是否确实是该模拟的子进程。
 
-        必须 fail closed：只有正向确认（cmdline 或 cwd 指向本模拟）才返回
-        PID_OURS。无法确认时返回 PID_UNKNOWN，调用方应拒绝操作而不是发信号 ——
-        PID 会被复用，对一个陌生进程组 killpg 会杀掉无关进程。
+        必须 fail closed：只有精确匹配才返回 PID_OURS。无法确认时返回
+        PID_UNKNOWN，调用方必须拒绝操作而不是发信号 —— PID 会被复用，
+        对陌生进程组 killpg 会杀掉无关进程。
         """
         try:
             os.kill(pid, 0)      # 不发信号，仅探测
@@ -249,27 +288,23 @@ class SimulationRunner:
             # 存在但不属于当前用户；我们的子进程一定同属主，所以不是我们的
             return cls.PID_OTHER
 
-        def _identifies(cmdline: str, cwd: str) -> bool:
-            return simulation_id in (cmdline or '') or simulation_id in (cwd or '')
-
         # Linux: /proc 最直接
         proc_dir = f'/proc/{pid}'
         if os.path.isdir(proc_dir):
-            cmdline = cwd = ''
+            argv, cwd = None, ''
             try:
                 with open(f'{proc_dir}/cmdline', 'rb') as f:
-                    cmdline = f.read().decode('utf-8', 'replace')
+                    raw = f.read().decode('utf-8', 'replace')
+                argv = [a for a in raw.split('\0') if a]
             except Exception:
-                pass
+                argv = None
             try:
                 cwd = os.readlink(f'{proc_dir}/cwd')
             except Exception:
-                pass
-            if cmdline or cwd:
-                return cls.PID_OURS if _identifies(cmdline, cwd) else cls.PID_OTHER
-            return cls.PID_UNKNOWN
+                cwd = ''
+            return cls._identify_argv(argv, cwd, simulation_id)
 
-        # 其它平台（macOS/Windows）：psutil 已经在依赖树里（camel-oasis 传递依赖）
+        # 其它平台（macOS/Windows）：psutil 是 camel-oasis 的传递依赖
         try:
             import psutil
         except ImportError:
@@ -278,16 +313,14 @@ class SimulationRunner:
         try:
             proc = psutil.Process(pid)
             try:
+                argv = proc.cmdline()
+            except Exception:
+                argv = None
+            try:
                 cwd = proc.cwd()
             except Exception:
                 cwd = ''
-            try:
-                cmdline = ' '.join(proc.cmdline())
-            except Exception:
-                cmdline = ''
-            if not cmdline and not cwd:
-                return cls.PID_UNKNOWN
-            return cls.PID_OURS if _identifies(cmdline, cwd) else cls.PID_OTHER
+            return cls._identify_argv(argv, cwd, simulation_id)
         except psutil.NoSuchProcess:
             return cls.PID_DEAD
         except psutil.AccessDenied:
@@ -346,9 +379,7 @@ class SimulationRunner:
         if status in (cls.PID_DEAD, cls.PID_OTHER):
             return True
         if status == cls.PID_UNKNOWN:
-            logger.error(
-                f"无法确认 {simulation_id} 的子进程身份，拒绝发送信号"
-            )
+            logger.error(f"无法确认 {simulation_id} 的子进程身份，拒绝发送信号")
             return False
 
         state = cls.get_run_state(simulation_id)
@@ -375,11 +406,13 @@ class SimulationRunner:
 
             deadline = time.time() + (timeout if sig is signal.SIGTERM else 3)
             while time.time() < deadline:
-                if cls._probe_pid(pid, simulation_id) != cls.PID_OURS:
+                # 只有确认死亡（或确认换成了别的进程）才算终止成功。
+                # PID_UNKNOWN 表示身份读不出来了，进程可能还活着，不能当成功。
+                if cls._probe_pid(pid, simulation_id) in (cls.PID_DEAD, cls.PID_OTHER):
                     return True
                 time.sleep(0.2)
 
-        return cls._probe_pid(pid, simulation_id) != cls.PID_OURS
+        return cls._probe_pid(pid, simulation_id) in (cls.PID_DEAD, cls.PID_OTHER)
 
     @classmethod
     def forget_simulation(cls, simulation_id: str, join_timeout: float = 5.0):
