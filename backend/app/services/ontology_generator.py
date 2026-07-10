@@ -281,6 +281,11 @@ Based on the above, design the entity types and relationship types for a social 
     
     def _validate_and_process(self, result: Dict[str, Any]) -> Dict[str, Any]:
         """验证和后处理结果"""
+        # Zep API 上限；必须在下面的循环使用之前定义
+        MAX_ENTITY_TYPES = 10
+        MAX_EDGE_TYPES = 10
+        MAX_SOURCE_TARGETS = 10
+
         
         # 确保必要字段存在
         if "entity_types" not in result:
@@ -350,9 +355,6 @@ Based on the above, design the entity types and relationship types for a social 
                 edge["description"] = edge["description"][:97] + "..."
         
         # Zep API 限制：最多 10 个自定义实体类型，最多 10 个自定义边类型
-        MAX_ENTITY_TYPES = 10
-        MAX_EDGE_TYPES = 10
-        MAX_SOURCE_TARGETS = 10   # Zep API 上限
 
         # 去重：按 name 去重，保留首次出现的
         seen_names = set()
