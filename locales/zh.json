@@ -328,6 +328,8 @@
     "simDeleteHandleCloseFailed": "关闭 {stream} 句柄失败: {error}",
     "simDeleteScanUnreadable": "无法读取 {path}，已保守地视其为引用者并拒绝删除共享数据。",
     "simDeleteProcessAlive": "{id} 仍有无法终止的模拟进程，已拒绝本次删除。",
+    "simDeleteRunStateCorrupt": "{id} 的 run_state.json 存在但无法解析，无法排除仍有遗留子进程，已拒绝删除。请修复或移除该文件后重试。",
+    "simDeleteProcessUnverifiable": "{id} 记录的 PID 对应的进程存在，但无法确认就是本模拟的子进程。为避免误杀无关进程，已拒绝删除。",
     "simDeleteInvalidId": "非法的模拟ID: {id}",
     "simDeleteNotFound": "模拟不存在: {id}",
     "simDeleteStarting": "模拟 {id} 正在启动中，暂时无法删除，请稍后重试。",

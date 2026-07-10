@@ -2883,7 +2883,28 @@ def delete_simulation(simulation_id: str):
 
     # STARTING 只有在确实存在活着的子进程时才拒绝删除；否则那是上次进程被
     # 强杀留下的残留状态，永远拒绝会让这个模拟再也删不掉。
-    live = SimulationRunner.has_live_process(simulation_id)
+    # run_state.json 读不出来时拿不到 process_pid，也就无法排除遗留子进程。
+    # _load_run_state() 把解析失败也返回 None，与「文件不存在」无法区分，
+    # 所以必须单独检查文件本身。
+    if not SimulationRunner.run_state_file_readable(simulation_id):
+        return jsonify({
+            "success": False,
+            "error_code": "run_state_corrupt",
+            "error": t('api.simDeleteRunStateCorrupt', id=simulation_id),
+        }), 409
+
+    probe = SimulationRunner.probe_orphan_process(simulation_id)
+
+    # 存在一个进程但无法确认身份：既不能删目录（它可能还在写），
+    # 也不能 killpg（可能杀掉复用了该 PID 的无关进程）。
+    if probe == SimulationRunner.PID_UNKNOWN:
+        return jsonify({
+            "success": False,
+            "error_code": "process_unverifiable",
+            "error": t('api.simDeleteProcessUnverifiable', id=simulation_id),
+        }), 409
+
+    live = probe == SimulationRunner.PID_OURS
 
     if status == RunnerStatus.STARTING and live:
         return jsonify({

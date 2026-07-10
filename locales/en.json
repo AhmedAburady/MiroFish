@@ -328,6 +328,8 @@
     "simDeleteHandleCloseFailed": "Failed to close the {stream} handle: {error}",
     "simDeleteScanUnreadable": "Could not read {path}; treating it as a referrer and refusing to delete shared data.",
     "simDeleteProcessAlive": "A live simulation process for {id} could not be terminated. Deletion was refused.",
+    "simDeleteRunStateCorrupt": "The run state for {id} exists but cannot be parsed, so a surviving simulation process cannot be ruled out. Deletion was refused. Fix or remove run_state.json and retry.",
+    "simDeleteProcessUnverifiable": "A process with the recorded PID for {id} exists but could not be positively identified as this simulation. Deletion was refused rather than risk signalling an unrelated process.",
     "simDeleteInvalidId": "Invalid simulation id: {id}",
     "simDeleteNotFound": "Simulation not found: {id}",
     "simDeleteStarting": "Simulation {id} is still starting and cannot be deleted yet. Try again shortly.",
