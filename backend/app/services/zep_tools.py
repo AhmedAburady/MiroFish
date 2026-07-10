@@ -1742,9 +1742,10 @@ Write the interview summary."""
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0.3,
-                # ~450 英文单词约 600 token，留出余量避免摘要被截断。
-                # 提示词里的字数上限必须和这里保持一致。
-                max_tokens=900
+                # ~450 英文单词约 600 token。推理模型的推理 token 也计入
+                # max_tokens，所以留出足够余量，否则推理会吃光预算、
+                # content 返回 None。
+                max_tokens=8192
             )
             return summary
             

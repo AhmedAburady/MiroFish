@@ -36,7 +36,7 @@ class LLMClient:
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
-        max_tokens: int = 4096,
+        max_tokens: int = 16384,
         response_format: Optional[Dict] = None
     ) -> str:
         """
@@ -62,16 +62,38 @@ class LLMClient:
             kwargs["response_format"] = response_format
         
         response = self.client.chat.completions.create(**kwargs)
-        content = response.choices[0].message.content
+        choice = response.choices[0]
+        content = choice.message.content
+
+        # 推理模型（deepseek-v4-pro、o系列等）会先消耗 max_tokens 产出推理内容。
+        # 推理把预算吃光时，content 会是 None 而不是空串 —— 直接丢给 re.sub
+        # 会抛 TypeError: expected string or bytes-like object。
+        if content is None:
+            finish = getattr(choice, 'finish_reason', None)
+            reasoning = getattr(choice.message, 'reasoning', None)
+            reasoning_len = len(reasoning or '')
+            if finish == 'length':
+                raise ValueError(
+                    f"LLM 未返回内容：max_tokens={max_tokens} 被推理过程耗尽 "
+                    f"(finish_reason=length, reasoning={reasoning_len} 字符)。"
+                    f"请调大 max_tokens，或改用非推理模型。"
+                )
+            raise ValueError(
+                f"LLM 未返回内容 (finish_reason={finish}, "
+                f"reasoning={reasoning_len} 字符)"
+            )
+
         # 部分模型（如MiniMax M2.5）会在content中包含<think>思考内容，需要移除
         content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
+        if not content:
+            raise ValueError("LLM 返回了空内容")
         return content
     
     def chat_json(
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.3,
-        max_tokens: int = 4096
+        max_tokens: int = 16384
     ) -> Dict[str, Any]:
         """
         发送聊天请求并返回JSON

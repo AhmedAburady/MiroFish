@@ -214,10 +214,13 @@ class OntologyGenerator:
         ]
         
         # 调用LLM
+        # 推理模型（如 deepseek-v4-pro）的推理 token 也计入 max_tokens。
+        # 本体 JSON 本身约 1k token，但推理可能吃掉数千 token；4096 会导致
+        # 预算被推理耗尽、content 返回 None。
         result = self.llm_client.chat_json(
             messages=messages,
             temperature=0.3,
-            max_tokens=4096
+            max_tokens=16384
         )
         
         # 验证和后处理
