@@ -699,8 +699,8 @@ Context:
 
 Return JSON with the following fields:
 
-1. bio: social-media bio, around 200 words
-2. persona: detailed persona description (around 2000 words of plain text), covering:
+1. bio: social-media bio, around 120 words
+2. persona: detailed persona description (around 1200 words of plain text), covering:
    - Basic information (age, occupation, education, location)
    - Background (formative experiences, connection to the event, social relationships)
    - Personality (MBTI type, core traits, how they express emotion)
@@ -748,8 +748,8 @@ Context:
 
 Return JSON with the following fields:
 
-1. bio: official account bio, around 200 words, professional in tone
-2. persona: detailed account description (around 2000 words of plain text), covering:
+1. bio: official account bio, around 120 words, professional in tone
+2. persona: detailed account description (around 1200 words of plain text), covering:
    - Organisation basics (formal name, nature, founding background, main functions)
    - Account positioning (account type, target audience, core purpose)
    - Voice (language characteristics, stock phrases, topics it avoids)

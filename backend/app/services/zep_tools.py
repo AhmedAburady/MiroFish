@@ -18,7 +18,7 @@ from zep_cloud.client import Zep
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.llm_client import LLMClient
-from ..utils.locale import get_locale, t
+from ..utils.locale import get_language_instruction, get_locale, t
 from ..utils.zep_paging import fetch_all_nodes, fetch_all_edges
 
 logger = get_logger('mirofish.zep_tools')
@@ -1109,6 +1109,9 @@ Requirements:
 2. The sub-questions should cover different dimensions of the original question (who, what, why, how, when, where)
 3. The sub-questions must be relevant to the simulation scenario
 4. Return JSON: {"sub_queries": ["sub-question 1", "sub-question 2", ...]}"""
+        # 提示词是英文，但子问题必须用报告语言生成，否则 zh/es/fr 等 locale 下
+        # 会拿到英文子问题。
+        system_prompt = f"{system_prompt}\n\n{get_language_instruction()}"
 
         user_prompt = f"""Simulation requirement:
 {simulation_requirement}
@@ -1598,6 +1601,8 @@ Return JSON:
     "selected_indices": [indices of the selected agents],
     "reasoning": "why these agents were chosen"
 }"""
+        system_prompt = f"{system_prompt}\n\n{get_language_instruction()}\n" \
+            "Only the 'reasoning' text uses that language; selected_indices stays numeric."
 
         user_prompt = f"""Interview brief:
 {interview_requirement}
@@ -1660,6 +1665,7 @@ Requirements:
 6. Ask the question directly, with no preamble or prefix
 
 Return JSON: {"questions": ["question 1", "question 2", ...]}"""
+        system_prompt = f"{system_prompt}\n\n{get_language_instruction()}"
 
         user_prompt = f"""Interview brief: {interview_requirement}
 
@@ -1718,7 +1724,9 @@ Formatting constraints (must be followed):
 - Do not use Markdown headings (#, ##, ###)
 - Do not use horizontal rules (---, ***)
 - {quote_instruction}
-- You may use **bold** to mark key terms, but no other Markdown syntax"""
+- You may use **bold** to mark key terms, but no other Markdown syntax
+
+{get_language_instruction()}"""
 
         user_prompt = f"""Interview topic: {interview_requirement}
 

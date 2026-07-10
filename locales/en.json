@@ -300,7 +300,7 @@
   "history": {
     "title": "Simulation History",
     "deleteRun": "Delete this run",
-    "deleteConfirm": "Delete run {id}? This stops it if running, deletes its Zep graph, and removes its data. The project and uploaded documents are kept.",
+    "deleteConfirm": "Delete run {id}? This stops it if running and removes its data. The knowledge graph, the project and the uploaded documents are kept, since other runs may share them.",
     "deletePartial": "Run deleted, but some cleanup failed: {warnings}",
     "deleteFailed": "Delete failed: {error}",
     "graphBuild": "Graph Build",

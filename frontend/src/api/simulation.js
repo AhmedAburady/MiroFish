@@ -187,10 +187,13 @@ export const getSimulationHistory = (limit = 20) => {
 
 
 /**
- * 删除模拟：停止运行 -> 删除 Zep 图谱 -> 删除模拟目录。
+ * 删除模拟：停止运行 -> 删除模拟目录。
+ *
+ * 默认不删除 Zep 图谱：项目与其派生的所有模拟共享同一个 graph_id，
+ * 删掉它会让项目和其它模拟指向一个不存在的图谱。
  * 不重试：删除不是幂等操作。
  */
-export const deleteSimulation = (simulationId, { deleteGraph = true, deleteProject = false } = {}) => {
+export const deleteSimulation = (simulationId, { deleteGraph = false, deleteProject = false } = {}) => {
   return service.delete(`/api/simulation/${simulationId}`, {
     params: { delete_graph: deleteGraph, delete_project: deleteProject }
   })

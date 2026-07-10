@@ -168,13 +168,20 @@ npm run frontend  # Start frontend only
 # 1. Configure environment variables (same as source deployment)
 cp .env.example .env
 
-# 2. Pull image and start
-docker compose up -d
+# 2. Build from this source and start
+docker compose up -d --build
 ```
 
-Reads `.env` from root directory by default, maps ports `3000 (frontend) / 5001 (backend)`
+Reads `.env` from the root directory by default, and maps ports `3001 (frontend) / 5002 (backend)`.
 
-> Mirror address for faster pulling is provided as comments in `docker-compose.yml`, replace if needed.
+**Service URLs (Docker):**
+- Frontend: `http://localhost:3001`
+- Backend API: `http://localhost:5002`
+
+> `compose.yml` builds from this checkout rather than pulling a published image, so
+> local changes take effect. If you browse from a different machine, set
+> `MIROFISH_HOST` in `.env` to this host's IP, otherwise the frontend will try to
+> reach the backend on the *browser's* localhost.
 
 ## 📬 Join the Conversation
 

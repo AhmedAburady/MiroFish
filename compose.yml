@@ -13,7 +13,11 @@ services:
     env_file:
       - .env
     environment:
-      - VITE_API_BASE_URL=http://192.168.1.134:5002
+      # The frontend is served to the browser, so this URL is resolved by the
+      # browser, not by the container. On a remote host set MIROFISH_HOST to
+      # that host's IP or hostname (e.g. MIROFISH_HOST=192.168.1.134), or put
+      # it in .env. Defaults to localhost for a local browser.
+      - VITE_API_BASE_URL=http://${MIROFISH_HOST:-localhost}:5002
     ports:
       - "3001:3000"
       - "5002:5001"

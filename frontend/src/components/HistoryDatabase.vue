@@ -406,8 +406,9 @@ const navigateToProject = (simulation) => {
   selectedProject.value = simulation
 }
 
-// 删除一次运行：停止进程 -> 删除 Zep 图谱 -> 删除模拟目录。
-// 项目（上传的文档与本体）默认保留，因为它可以被复用来重建图谱。
+// 删除一次运行：停止进程 -> 删除模拟目录。
+// 图谱与项目都保留：项目及其派生的所有模拟共享同一个 graph_id，
+// 删掉图谱会让它们全部指向一个不存在的图谱。
 const handleDelete = async (project) => {
   const id = project.simulation_id
   if (deletingId.value) return
@@ -415,7 +416,7 @@ const handleDelete = async (project) => {
 
   deletingId.value = id
   try {
-    const res = await deleteSimulation(id, { deleteGraph: true, deleteProject: false })
+    const res = await deleteSimulation(id, { deleteGraph: false, deleteProject: false })
     if (res.warnings?.length) {
       console.warn('删除时出现警告:', res.warnings)
       window.alert(t('history.deletePartial', { warnings: res.warnings.join('; ') }))

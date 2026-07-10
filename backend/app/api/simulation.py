@@ -4,6 +4,7 @@ Step2: Zep实体读取与过滤、OASIS模拟准备与运行（全程自动化�
 """
 
 import os
+import re
 import traceback
 from flask import request, jsonify, send_file
 
@@ -22,7 +23,10 @@ logger = get_logger('mirofish.api.simulation')
 
 # Interview prompt 优化前缀
 # 添加此前缀可以避免Agent调用工具，直接用文本回复
-INTERVIEW_PROMPT_PREFIX = "结合你的人设、所有的过往记忆与行动，不调用任何工具直接用文本回复我："
+INTERVIEW_PROMPT_PREFIX = (
+    "Drawing on your persona, all of your past memories and your actions, "
+    "reply to me directly in plain text without calling any tool: "
+)
 
 
 def optimize_interview_prompt(prompt: str) -> str:
@@ -2719,14 +2723,82 @@ def close_simulation_env():
 # ============================================================================
 # Simulation deletion (no such endpoint exists upstream)
 # ============================================================================
+
+# simulation_id 会被拼进文件系统路径并交给 shutil.rmtree，必须严格校验。
+_SIMULATION_ID_RE = re.compile(r'^sim_[0-9a-zA-Z]{6,32}$')
+
+
+def _resolve_simulation_dir(simulation_id: str) -> str:
+    """校验 simulation_id 并返回其目录的真实路径。
+
+    两道防线：格式白名单，以及解析后的路径必须仍位于
+    OASIS_SIMULATION_DATA_DIR 之内（防止 ".." 或符号链接逃逸）。
+    """
+    if not _SIMULATION_ID_RE.match(simulation_id):
+        raise ValueError(f"非法的 simulation_id: {simulation_id!r}")
+
+    root = os.path.realpath(Config.OASIS_SIMULATION_DATA_DIR)
+    target = os.path.realpath(os.path.join(root, simulation_id))
+    if target != root and not target.startswith(root + os.sep):
+        raise ValueError(f"simulation_id 越出模拟目录: {simulation_id!r}")
+    return target
+
+
+def _graph_is_referenced_elsewhere(graph_id: str, exclude_simulation_id: str) -> list:
+    """返回仍在引用该图谱的项目与其它模拟。
+
+    一个项目的图谱会被它派生出的每一个模拟共享
+    （create 时 graph_id = data.get('graph_id') or project.graph_id），
+    所以删除单次运行时默认不能删图谱。
+    """
+    import json as _json
+    referrers = []
+
+    sims_root = Config.OASIS_SIMULATION_DATA_DIR
+    if os.path.isdir(sims_root):
+        for sid in os.listdir(sims_root):
+            if sid == exclude_simulation_id:
+                continue
+            state_path = os.path.join(sims_root, sid, 'state.json')
+            if not os.path.exists(state_path):
+                continue
+            try:
+                with open(state_path, 'r', encoding='utf-8') as f:
+                    if _json.load(f).get('graph_id') == graph_id:
+                        referrers.append(f'simulation:{sid}')
+            except Exception:
+                continue
+
+    # 直接扫描目录，不用 ProjectManager.list_projects()：它默认只返回 50 条，
+    # 漏掉一个项目就会误删仍在使用的图谱。
+    projects_root = ProjectManager.PROJECTS_DIR
+    if os.path.isdir(projects_root):
+        for pid in os.listdir(projects_root):
+            proj_path = os.path.join(projects_root, pid, 'project.json')
+            if not os.path.exists(proj_path):
+                continue
+            try:
+                with open(proj_path, 'r', encoding='utf-8') as f:
+                    if _json.load(f).get('graph_id') == graph_id:
+                        referrers.append(f'project:{pid}')
+            except Exception:
+                continue
+
+    return referrers
+
+
 @simulation_bp.route('/<simulation_id>', methods=['DELETE'])
 def delete_simulation(simulation_id: str):
     """
     删除模拟及其关联数据
 
     Query 参数：
-        delete_graph=true|false    是否同时删除 Zep 图谱（默认 true）
+        delete_graph=true|false    是否同时删除 Zep 图谱（默认 false）
         delete_project=true|false  是否同时删除项目（默认 false）
+        force_graph=true|false     即使图谱仍被引用也强制删除（默认 false）
+
+    图谱默认保留：项目与其派生的所有模拟共享同一个 graph_id，
+    删掉它会让项目和其它模拟指向一个不存在的图谱。
     """
     import shutil
     import json as _json
@@ -2734,25 +2806,47 @@ def delete_simulation(simulation_id: str):
     def _flag(name: str, default: str) -> bool:
         return request.args.get(name, default).lower() in ('1', 'true', 'yes')
 
-    delete_graph = _flag('delete_graph', 'true')
+    delete_graph = _flag('delete_graph', 'false')
     delete_project = _flag('delete_project', 'false')
+    force_graph = _flag('force_graph', 'false')
 
-    sim_dir = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id)
-    if not os.path.exists(sim_dir):
+    try:
+        sim_dir = _resolve_simulation_dir(simulation_id)
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+    if not os.path.isdir(sim_dir):
         return jsonify({"success": False, "error": f"模拟不存在: {simulation_id}"}), 404
 
     deleted = {"simulation": False, "graph": None, "project": None}
     warnings = []
 
-    # 1. 先停止运行中的模拟，否则子进程会继续写入已删除的目录
+    # 1. 先停止仍在运行的模拟，否则子进程会继续写入已删除的目录。
+    #    STARTING 状态下 stop_simulation 会直接抛错，此时进程可能正在拉起，
+    #    删目录并不安全，因此拒绝本次删除，让调用方稍后重试。
     try:
         state = SimulationRunner.get_run_state(simulation_id)
-        if state and state.runner_status in (RunnerStatus.RUNNING, RunnerStatus.STARTING,
-                                             RunnerStatus.PAUSED):
+    except Exception as e:
+        state = None
+        warnings.append(f"读取运行状态失败: {e}")
+
+    if state and state.runner_status == RunnerStatus.STARTING:
+        return jsonify({
+            "success": False,
+            "error": f"模拟正在启动中，暂时无法删除: {simulation_id}。请等待其进入运行状态后重试。",
+            "runner_status": str(state.runner_status),
+        }), 409
+
+    if state and state.runner_status in (RunnerStatus.RUNNING, RunnerStatus.PAUSED):
+        try:
             logger.info(f"删除前停止模拟: {simulation_id}")
             SimulationRunner.stop_simulation(simulation_id)
-    except Exception as e:
-        warnings.append(f"停止模拟失败: {e}")
+        except Exception as e:
+            # 停不掉就不能删目录，否则子进程会写入已删除的路径
+            return jsonify({
+                "success": False,
+                "error": f"无法停止运行中的模拟: {e}",
+            }), 409
 
     # 2. 目录删除后就拿不到 graph_id / project_id 了，先读出来
     graph_id = None
@@ -2767,15 +2861,21 @@ def delete_simulation(simulation_id: str):
         except Exception as e:
             warnings.append(f"读取 state.json 失败: {e}")
 
-    # 3. 删除 Zep Cloud 上的图谱
+    # 3. 删除 Zep 图谱（默认关闭；仍被引用时除非 force_graph 否则跳过）
     if delete_graph and graph_id:
-        try:
-            from ..services.graph_builder import GraphBuilderService
-            GraphBuilderService().delete_graph(graph_id)
-            deleted["graph"] = graph_id
-            logger.info(f"已删除图谱: {graph_id}")
-        except Exception as e:
-            warnings.append(f"删除图谱失败 ({graph_id}): {e}")
+        referrers = _graph_is_referenced_elsewhere(graph_id, simulation_id)
+        if referrers and not force_graph:
+            warnings.append(
+                f"图谱 {graph_id} 仍被以下对象引用，已跳过删除: {', '.join(referrers)}"
+            )
+        else:
+            try:
+                from ..services.graph_builder import GraphBuilderService
+                GraphBuilderService().delete_graph(graph_id)
+                deleted["graph"] = graph_id
+                logger.info(f"已删除图谱: {graph_id}")
+            except Exception as e:
+                warnings.append(f"删除图谱失败 ({graph_id}): {e}")
 
     # 4. 删除模拟目录
     try:

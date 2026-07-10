@@ -300,7 +300,7 @@
   "history": {
     "title": "推演记录",
     "deleteRun": "删除此次运行",
-    "deleteConfirm": "确定删除运行 {id}？将停止运行中的模拟、删除其 Zep 图谱并移除数据。项目与已上传文档会保留。",
+    "deleteConfirm": "确定删除运行 {id}？将停止运行中的模拟并移除其数据。知识图谱、项目与已上传文档都会保留，因为其它运行可能共享它们。",
     "deletePartial": "模拟已删除，但部分清理失败：{warnings}",
     "deleteFailed": "删除失败：{error}",
     "graphBuild": "图谱构建",
