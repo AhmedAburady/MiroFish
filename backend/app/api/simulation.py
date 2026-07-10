@@ -2949,6 +2949,23 @@ def delete_simulation(simulation_id: str):
                     "error": t('api.simDeleteProcessAlive', id=simulation_id),
                 }), 409
 
+    # 进程组归属的判定依赖「某个成员 cwd == sim_dir」。万一我们自己的子孙
+    # chdir 走了，它会被误判成 GROUP_FOREIGN 而放行删除。因此在 rmtree 之前
+    # 再做一次与进程组无关的直接检查：还有没有进程待在这个目录里。
+    recorded = SimulationRunner.get_run_state(simulation_id)
+    recorded_pgid = getattr(recorded, 'process_pid', None) if recorded else None
+    dir_state = SimulationRunner.simulation_dir_in_use(simulation_id, pgid=recorded_pgid)
+    if dir_state != SimulationRunner.DIR_FREE:
+        code = ("process_alive" if dir_state == SimulationRunner.DIR_IN_USE
+                else "process_unverifiable")
+        key = ('api.simDeleteProcessAlive' if dir_state == SimulationRunner.DIR_IN_USE
+               else 'api.simDeleteProcessUnverifiable')
+        return jsonify({
+            "success": False,
+            "error_code": code,
+            "error": t(key, id=simulation_id),
+        }), 409
+
     # 2. 让 Runner 忘掉它。监控线程会 _save_run_state()，那是
     #    makedirs(exist_ok=True) + 写文件，会把刚删掉的目录重建出来，
     #    所以线程没退出就必须拒绝删除，而不是仅仅记一条警告。

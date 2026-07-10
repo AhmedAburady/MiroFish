@@ -436,6 +436,114 @@ class SimulationRunner:
 
         return cls.GROUP_UNKNOWN if unreadable else cls.GROUP_FOREIGN
 
+    # 目录占用判定结果
+    DIR_FREE = 'free'          # 没有任何活进程以该目录为 cwd
+    DIR_IN_USE = 'in_use'      # 至少一个活进程仍在该目录里
+    DIR_UNKNOWN = 'unknown'    # 无法枚举/读取，无从判断
+
+    @staticmethod
+    def _read_pgrp(pid) -> int:
+        """从 /proc/<pid>/stat 读取 pgrp。stat 是全局可读的，即使 cwd 不可读。"""
+        with open(f'/proc/{pid}/stat', 'r') as f:
+            raw = f.read()
+        # comm 字段可能含空格与括号，从最后一个 ')' 之后开始切
+        fields = raw[raw.rindex(')') + 2:].split()
+        return int(fields[2])          # state, ppid, pgrp
+
+    @classmethod
+    def simulation_dir_in_use(cls, simulation_id: str, pgid: int = None) -> str:
+        """删除目录前的最终检查：还有没有属于本模拟的活进程。
+
+        判据有两条，命中任一即视为占用：
+        1. 进程的 cwd 精确等于模拟目录（子孙默认继承 cwd）；
+        2. 进程的 pgrp 等于本模拟记录的 pgid（覆盖 chdir 走了的子孙）。
+
+        进程组归属判定依赖条件 1，一旦我们自己的子孙 chdir 离开，
+        它会被误判成 GROUP_FOREIGN 而放行删除；条件 2 补上这个缺口。
+
+        只扫同属主的进程：我们的子孙一定与当前进程同 uid，别人的进程读不到
+        cwd 是正常的，不该把结果拖成 UNKNOWN，否则多用户机器上永远删不掉。
+        同属主但 cwd 不可读（dumpable=0）的进程改用 pgrp 判断。
+        """
+        sim_dir, _config, _scripts = cls._expected_identity(simulation_id)
+        unreadable = False
+
+        if os.path.isdir('/proc'):
+            our_uid = os.getuid()
+            for entry in os.listdir('/proc'):
+                if not entry.isdigit():
+                    continue
+                try:
+                    if os.stat(f'/proc/{entry}').st_uid != our_uid:
+                        continue            # 别人的进程不可能是我们的子孙
+                except (ProcessLookupError, FileNotFoundError):
+                    continue
+                except Exception:
+                    unreadable = True
+                    continue
+
+                # 条件 1：cwd 精确等于模拟目录
+                cwd = None
+                try:
+                    cwd = os.readlink(f'/proc/{entry}/cwd')
+                except (ProcessLookupError, FileNotFoundError):
+                    continue                # 刚退出，不算占用
+                except Exception:
+                    cwd = None              # dumpable=0 等：退回 pgrp 判断
+
+                if cwd is not None:
+                    try:
+                        if os.path.realpath(cwd) == sim_dir:
+                            return cls.DIR_IN_USE
+                    except Exception:
+                        cwd = None
+
+                # 条件 2：pgrp 等于本模拟的进程组（覆盖 chdir 走了的子孙）。
+                # 即使 cwd 可读且不匹配也要查：子孙可能已经 chdir 离开。
+                if pgid is not None:
+                    try:
+                        if cls._read_pgrp(entry) == pgid:
+                            return cls.DIR_IN_USE
+                        continue            # 两条都不命中 -> 与我们无关
+                    except (ProcessLookupError, FileNotFoundError):
+                        continue
+                    except Exception:
+                        unreadable = True
+                        continue
+
+                # 没有 pgid 可比对：从未持久化过 process_pid，也就不可能有我们的
+                # 子孙。cwd 读不到的同属主进程（ssh-agent 等）与本模拟无关，跳过。
+                if cwd is None:
+                    continue
+            return cls.DIR_UNKNOWN if unreadable else cls.DIR_FREE
+
+        try:
+            import psutil
+        except ImportError:
+            return cls.DIR_UNKNOWN
+
+        me = psutil.Process().username()
+        for proc in psutil.process_iter(['pid', 'username']):
+            try:
+                if proc.info.get('username') != me:
+                    continue
+                if os.path.realpath(proc.cwd()) == sim_dir:
+                    return cls.DIR_IN_USE
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                continue
+            except psutil.AccessDenied:
+                if pgid is None:
+                    unreadable = True
+                    continue
+                try:
+                    if os.getpgid(proc.info['pid']) == pgid:
+                        return cls.DIR_IN_USE
+                except Exception:
+                    unreadable = True
+            except Exception:
+                unreadable = True
+        return cls.DIR_UNKNOWN if unreadable else cls.DIR_FREE
+
     @staticmethod
     def _process_group_alive(pgid: int) -> bool:
         """进程组里是否还有成员。
