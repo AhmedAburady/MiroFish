@@ -185,3 +185,13 @@ export const getSimulationHistory = (limit = 20) => {
   return service.get('/api/simulation/history', { params: { limit } })
 }
 
+
+/**
+ * 删除模拟：停止运行 -> 删除 Zep 图谱 -> 删除模拟目录。
+ * 不重试：删除不是幂等操作。
+ */
+export const deleteSimulation = (simulationId, { deleteGraph = true, deleteProject = false } = {}) => {
+  return service.delete(`/api/simulation/${simulationId}`, {
+    params: { delete_graph: deleteGraph, delete_project: deleteProject }
+  })
+}

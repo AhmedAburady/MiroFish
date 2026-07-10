@@ -687,11 +687,50 @@ watch(() => props.systemLogs?.length, () => {
   })
 })
 
+// doStartSimulation() passes force: true, which makes the backend stop a
+// running simulation and restart it from round 0. Calling it unconditionally
+// on mount meant a page refresh destroyed a live run. Probe first, then decide.
+const attachOrStart = async () => {
+  if (!props.simulationId) return
+
+  let state = null
+  try {
+    const res = await getRunStatus(props.simulationId)
+    if (res.success && res.data) state = res.data
+  } catch (err) {
+    console.warn('获取运行状态失败，按未启动处理:', err)
+  }
+
+  const status = state?.runner_status
+
+  if (status === 'running' || status === 'starting' || status === 'paused') {
+    addLog(t('log.reattachedToRunning'))
+    phase.value = 1
+    runStatus.value = state
+    prevTwitterRound.value = state.twitter_current_round || 0
+    prevRedditRound.value = state.reddit_current_round || 0
+    emit('update-status', 'processing')
+    startStatusPolling()
+    startDetailPolling()
+    fetchRunStatusDetail()
+    return
+  }
+
+  if (status === 'completed' || status === 'stopped') {
+    addLog(t('log.reattachedToFinished'))
+    phase.value = 2
+    runStatus.value = state
+    emit('update-status', 'completed')
+    fetchRunStatusDetail()
+    return
+  }
+
+  doStartSimulation()
+}
+
 onMounted(() => {
   addLog(t('log.step3Init'))
-  if (props.simulationId) {
-    doStartSimulation()
-  }
+  attachOrStart()
 })
 
 onUnmounted(() => {

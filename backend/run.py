@@ -42,7 +42,15 @@ def main():
     debug = Config.DEBUG
     
     # 启动服务
-    app.run(host=host, port=port, debug=debug, threaded=True)
+    #
+    # use_reloader=False: simulations are subprocess.Popen children, and
+    # SimulationRunner registers atexit.cleanup_all_simulations plus SIGTERM
+    # handlers. Werkzeug's stat reloader restarts the process on any .py
+    # change, which fires that cleanup and kills every running simulation.
+    # A simulation is hours of LLM spend, so an editor save must never end one.
+    # Set FLASK_USE_RELOADER=1 to opt back in.
+    use_reloader = os.environ.get('FLASK_USE_RELOADER', '0') == '1'
+    app.run(host=host, port=port, debug=debug, threaded=True, use_reloader=use_reloader)
 
 
 if __name__ == '__main__':

@@ -47,6 +47,13 @@
               :class="{ available: project.report_id, unavailable: !project.report_id }"
               :title="$t('history.analysisReport')"
             >◆</span>
+            <!-- click.stop：卡片整体是导航目标 -->
+            <button
+              class="card-delete"
+              :disabled="deletingId === project.simulation_id"
+              :title="$t('history.deleteRun')"
+              @click.stop="handleDelete(project)"
+            >{{ deletingId === project.simulation_id ? '⋯' : '×' }}</button>
           </div>
         </div>
 
@@ -194,7 +201,7 @@
 import { ref, computed, onMounted, onUnmounted, onActivated, watch, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { getSimulationHistory } from '../api/simulation'
+import { getSimulationHistory, deleteSimulation } from '../api/simulation'
 
 const router = useRouter()
 const route = useRoute()
@@ -207,6 +214,7 @@ const isExpanded = ref(false)
 const hoveringCard = ref(null)
 const historyContainer = ref(null)
 const selectedProject = ref(null)  // 当前选中的项目（用于弹窗）
+const deletingId = ref(null)       // 正在删除的 simulation_id
 let observer = null
 let isAnimating = false  // 动画锁，防止闪烁
 let expandDebounceTimer = null  // 防抖定时器
@@ -396,6 +404,30 @@ const truncateFilename = (filename, maxLength) => {
 // 打开项目详情弹窗
 const navigateToProject = (simulation) => {
   selectedProject.value = simulation
+}
+
+// 删除一次运行：停止进程 -> 删除 Zep 图谱 -> 删除模拟目录。
+// 项目（上传的文档与本体）默认保留，因为它可以被复用来重建图谱。
+const handleDelete = async (project) => {
+  const id = project.simulation_id
+  if (deletingId.value) return
+  if (!window.confirm(t('history.deleteConfirm', { id: formatSimulationId(id) }))) return
+
+  deletingId.value = id
+  try {
+    const res = await deleteSimulation(id, { deleteGraph: true, deleteProject: false })
+    if (res.warnings?.length) {
+      console.warn('删除时出现警告:', res.warnings)
+      window.alert(t('history.deletePartial', { warnings: res.warnings.join('; ') }))
+    }
+    await loadHistory()
+    if (selectedProject.value?.simulation_id === id) selectedProject.value = null
+  } catch (err) {
+    console.error('删除失败:', err)
+    window.alert(t('history.deleteFailed', { error: err.message }))
+  } finally {
+    deletingId.value = null
+  }
 }
 
 // 关闭弹窗
@@ -711,6 +743,29 @@ onUnmounted(() => {
   align-items: center;
   gap: 6px;
 }
+
+/* 删除按钮 */
+.card-delete {
+  margin-left: 2px;
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: #D1D5DB;
+  font-size: 0.95rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 0.15s, background-color 0.15s;
+}
+
+.project-card:hover .card-delete { color: #9CA3AF; }
+.card-delete:hover:not(:disabled) { background: #FEF2F2; color: #DC2626; }
+.card-delete:disabled { cursor: wait; color: #D1D5DB; }
 
 .status-icon {
   font-size: 0.75rem;

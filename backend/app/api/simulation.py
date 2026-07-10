@@ -2714,3 +2714,94 @@ def close_simulation_env():
             "error": str(e),
             "traceback": traceback.format_exc()
         }), 500
+
+
+# ============================================================================
+# Simulation deletion (no such endpoint exists upstream)
+# ============================================================================
+@simulation_bp.route('/<simulation_id>', methods=['DELETE'])
+def delete_simulation(simulation_id: str):
+    """
+    删除模拟及其关联数据
+
+    Query 参数：
+        delete_graph=true|false    是否同时删除 Zep 图谱（默认 true）
+        delete_project=true|false  是否同时删除项目（默认 false）
+    """
+    import shutil
+    import json as _json
+
+    def _flag(name: str, default: str) -> bool:
+        return request.args.get(name, default).lower() in ('1', 'true', 'yes')
+
+    delete_graph = _flag('delete_graph', 'true')
+    delete_project = _flag('delete_project', 'false')
+
+    sim_dir = os.path.join(Config.OASIS_SIMULATION_DATA_DIR, simulation_id)
+    if not os.path.exists(sim_dir):
+        return jsonify({"success": False, "error": f"模拟不存在: {simulation_id}"}), 404
+
+    deleted = {"simulation": False, "graph": None, "project": None}
+    warnings = []
+
+    # 1. 先停止运行中的模拟，否则子进程会继续写入已删除的目录
+    try:
+        state = SimulationRunner.get_run_state(simulation_id)
+        if state and state.runner_status in (RunnerStatus.RUNNING, RunnerStatus.STARTING,
+                                             RunnerStatus.PAUSED):
+            logger.info(f"删除前停止模拟: {simulation_id}")
+            SimulationRunner.stop_simulation(simulation_id)
+    except Exception as e:
+        warnings.append(f"停止模拟失败: {e}")
+
+    # 2. 目录删除后就拿不到 graph_id / project_id 了，先读出来
+    graph_id = None
+    project_id = None
+    state_path = os.path.join(sim_dir, "state.json")
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, 'r', encoding='utf-8') as f:
+                state_data = _json.load(f)
+            graph_id = state_data.get('graph_id')
+            project_id = state_data.get('project_id')
+        except Exception as e:
+            warnings.append(f"读取 state.json 失败: {e}")
+
+    # 3. 删除 Zep Cloud 上的图谱
+    if delete_graph and graph_id:
+        try:
+            from ..services.graph_builder import GraphBuilderService
+            GraphBuilderService().delete_graph(graph_id)
+            deleted["graph"] = graph_id
+            logger.info(f"已删除图谱: {graph_id}")
+        except Exception as e:
+            warnings.append(f"删除图谱失败 ({graph_id}): {e}")
+
+    # 4. 删除模拟目录
+    try:
+        shutil.rmtree(sim_dir)
+        deleted["simulation"] = True
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": f"删除模拟目录失败: {e}",
+            "deleted": deleted,
+            "warnings": warnings,
+        }), 500
+
+    # 5. 可选：删除项目
+    if delete_project and project_id:
+        try:
+            if ProjectManager.delete_project(project_id):
+                deleted["project"] = project_id
+            else:
+                warnings.append(f"项目不存在: {project_id}")
+        except Exception as e:
+            warnings.append(f"删除项目失败 ({project_id}): {e}")
+
+    return jsonify({
+        "success": True,
+        "message": f"已删除模拟: {simulation_id}",
+        "deleted": deleted,
+        "warnings": warnings,
+    })

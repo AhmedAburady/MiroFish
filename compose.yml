@@ -1,0 +1,28 @@
+name: mirofish-zep
+
+services:
+  mirofish-zep:
+    # Build from this clone, not ghcr.io/666ghj/mirofish:latest. The published
+    # image was built 2026-03-07 from 985f89f and predates i18n entirely (no
+    # locale.py, no LanguageSwitcher), so it hardcodes Chinese. It would also
+    # make this a comparison of a March backend against a current one.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mirofish-zep
+    env_file:
+      - .env
+    environment:
+      - VITE_API_BASE_URL=http://192.168.1.134:5002
+    ports:
+      - "3001:3000"
+      - "5002:5001"
+    restart: unless-stopped
+    volumes:
+      - ./backend/uploads:/app/backend/uploads
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5001/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
