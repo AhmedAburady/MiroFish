@@ -2934,7 +2934,8 @@ def delete_simulation(simulation_id: str):
                 "error_code": "process_unverifiable",
                 "error": t('api.simDeleteProcessUnverifiable', id=simulation_id),
             }), 409
-        if after == SimulationRunner.PID_OURS:
+        # PID_DEAD 只说明组长没了，子孙可能还在写目录；交给 terminate 判断组是否清空。
+        if after in (SimulationRunner.PID_OURS, SimulationRunner.PID_DEAD):
             if not SimulationRunner.terminate_orphan_process(simulation_id):
                 return jsonify({
                     "success": False,

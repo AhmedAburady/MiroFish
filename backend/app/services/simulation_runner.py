@@ -233,41 +233,66 @@ class SimulationRunner:
     PID_OTHER = 'other'      # 存在，但确认不是我们的（PID 已被复用）
     PID_UNKNOWN = 'unknown'  # 存在，但无法确认身份 —— 绝不能对它发信号
 
+    # 只有这三个脚本会被 start_simulation 拉起
+    RUNNER_SCRIPTS = (
+        'run_parallel_simulation.py',
+        'run_twitter_simulation.py',
+        'run_reddit_simulation.py',
+    )
+
     @classmethod
     def _expected_identity(cls, simulation_id: str):
-        """该模拟子进程应有的 cwd 与 --config 绝对路径。"""
+        """该模拟子进程应有的 cwd、--config 绝对路径、以及允许的脚本集合。"""
         sim_dir = os.path.realpath(os.path.join(cls.RUN_STATE_DIR, simulation_id))
         config_path = os.path.realpath(os.path.join(sim_dir, "simulation_config.json"))
-        return sim_dir, config_path
+        scripts = {
+            os.path.realpath(os.path.join(cls.SCRIPTS_DIR, name))
+            for name in cls.RUNNER_SCRIPTS
+        }
+        return sim_dir, config_path, scripts
 
     @classmethod
     def _identify_argv(cls, argv, cwd, simulation_id: str) -> str:
-        """按精确路径比对判断进程身份，返回 PID_*。
+        """按进程启动契约逐项精确比对，返回 PID_*。
 
-        不能用子串匹配：任何在模拟目录下运行的进程（例如
-        `tail sim_xxx/simulation.log`）命令行里都含有 simulation_id，
-        会被误判成 OASIS 子进程，进而被 killpg。
         子进程的启动方式是固定的：
-            cwd = <sim_dir>
-            argv = [python, run_*_simulation.py, "--config", <sim_dir>/simulation_config.json]
-        所以要求 argv 里出现精确的 config 绝对路径。
+            cwd  = <sim_dir>
+            argv = [python, <SCRIPTS_DIR>/run_*_simulation.py, "--config",
+                    <sim_dir>/simulation_config.json, ...]
+
+        必须同时满足全部条件才判为 PID_OURS：
+        1. cwd 可读且精确等于 <sim_dir>；
+        2. argv[1] 精确解析为三个 runner 脚本之一；
+        3. 存在 --config，且紧随其后的参数精确解析为 <sim_dir>/simulation_config.json。
+
+        任何一项信息缺失都返回 PID_UNKNOWN（拒绝操作），只有在信息齐全且
+        确定不匹配时才返回 PID_OTHER。仅仅「命令行里出现了这个 json 路径」
+        是不够的：任何打开该文件的无关进程都会命中。
         """
-        sim_dir, config_path = cls._expected_identity(simulation_id)
+        sim_dir, config_path, scripts = cls._expected_identity(simulation_id)
 
-        if not argv:
-            # 拿不到命令行就无法正向确认身份，cwd 单独不足以区分
+        # 1. cwd 必须可读且精确匹配。读不到 cwd 就无法确认身份。
+        if not cwd:
             return cls.PID_UNKNOWN
-
-        argv_ok = any(
-            os.path.realpath(a) == config_path
-            for a in argv
-            if isinstance(a, str) and a.endswith('.json')
-        )
-        if not argv_ok:
+        if os.path.realpath(cwd) != sim_dir:
             return cls.PID_OTHER
 
-        # 命令行匹配了，若 cwd 可读则必须同样精确匹配
-        if cwd and os.path.realpath(cwd) != sim_dir:
+        # 2. 命令行必须可读
+        if not argv or len(argv) < 2:
+            return cls.PID_UNKNOWN
+
+        # 3. argv[1] 必须是我们的 runner 脚本
+        if os.path.realpath(argv[1]) not in scripts:
+            return cls.PID_OTHER
+
+        # 4. --config 必须存在，且其后一个参数精确等于本模拟的 config
+        try:
+            idx = argv.index('--config')
+        except ValueError:
+            return cls.PID_OTHER
+        if idx + 1 >= len(argv):
+            return cls.PID_OTHER
+        if os.path.realpath(argv[idx + 1]) != config_path:
             return cls.PID_OTHER
 
         return cls.PID_OURS
@@ -276,9 +301,9 @@ class SimulationRunner:
     def _probe_pid(cls, pid: int, simulation_id: str) -> str:
         """判断 pid 是否确实是该模拟的子进程。
 
-        必须 fail closed：只有精确匹配才返回 PID_OURS。无法确认时返回
-        PID_UNKNOWN，调用方必须拒绝操作而不是发信号 —— PID 会被复用，
-        对陌生进程组 killpg 会杀掉无关进程。
+        必须 fail closed：只有全部身份条件都被正向确认才返回 PID_OURS。
+        无法确认时返回 PID_UNKNOWN，调用方必须拒绝操作而不是发信号 ——
+        PID 会被复用，对陌生进程组 killpg 会杀掉无关进程。
         """
         try:
             os.kill(pid, 0)      # 不发信号，仅探测
@@ -288,7 +313,6 @@ class SimulationRunner:
             # 存在但不属于当前用户；我们的子进程一定同属主，所以不是我们的
             return cls.PID_OTHER
 
-        # Linux: /proc 最直接
         proc_dir = f'/proc/{pid}'
         if os.path.isdir(proc_dir):
             argv, cwd = None, ''
@@ -327,6 +351,23 @@ class SimulationRunner:
             return cls.PID_OTHER
         except Exception:
             return cls.PID_UNKNOWN
+
+    @staticmethod
+    def _process_group_alive(pgid: int) -> bool:
+        """进程组里是否还有成员。
+
+        只看组长 PID 是不够的：组长收到 SIGTERM 退出后，子孙进程可能还活着，
+        仍然在往模拟目录里写文件。killpg(pgid, 0) 不发信号，只探测整个组。
+        """
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True          # 组还在，只是我们没权限 —— 保守视为存活
+        except Exception:
+            return True          # 无法确定 -> 视为存活，宁可拒绝删除
 
     @classmethod
     def run_state_file_readable(cls, simulation_id: str) -> bool:
@@ -374,10 +415,11 @@ class SimulationRunner:
 
         只有在身份被正向确认（PID_OURS）时才发信号。PID_UNKNOWN 一律返回 False，
         由调用方拒绝删除 —— 宁可删不掉，也不能 killpg 一个陌生进程组。
+
+        成功的判据是「整个进程组消失」，而不是「组长 PID 消失」：组长响应
+        SIGTERM 退出后，它的子孙可能还活着并继续写模拟目录。
         """
         status = cls.probe_orphan_process(simulation_id)
-        if status in (cls.PID_DEAD, cls.PID_OTHER):
-            return True
         if status == cls.PID_UNKNOWN:
             logger.error(f"无法确认 {simulation_id} 的子进程身份，拒绝发送信号")
             return False
@@ -387,32 +429,51 @@ class SimulationRunner:
         if not pid:
             return True
 
-        try:
-            pgid = os.getpgid(pid)
-        except ProcessLookupError:
+        # PID 被复用（PID_OTHER）说明我们的进程组早已清空 —— 进程组 ID 只有在
+        # 组内无成员后才会被回收再分配。此时没有需要终止的东西。
+        if status == cls.PID_OTHER:
             return True
-        except Exception as e:
-            logger.error(f"获取进程组失败: {simulation_id}, pid={pid}, error={e}")
-            return False
 
-        for sig in (signal.SIGTERM, signal.SIGKILL):
+        # 子进程以 start_new_session=True 启动，自成一组，故 pgid == pid。
+        # 组长可能已经退出（PID_DEAD），但它的子孙仍在写模拟目录。
+        # 只要该组还有成员，这个 pgid 就还没被回收，仍然是我们的组。
+        pgid = pid
+        if status == cls.PID_DEAD and not cls._process_group_alive(pgid):
+            return True
+
+        if status == cls.PID_OURS:
+            try:
+                actual = os.getpgid(pid)
+            except ProcessLookupError:
+                actual = pgid
+            except Exception as e:
+                logger.error(f"获取进程组失败: {simulation_id}, pid={pid}, error={e}")
+                return False
+            if actual != pid:
+                logger.error(
+                    f"{simulation_id} 的 pid={pid} 不是进程组组长 (pgid={actual})，拒绝 killpg"
+                )
+                return False
+
+        for sig, wait in ((signal.SIGTERM, timeout), (signal.SIGKILL, 5)):
             try:
                 os.killpg(pgid, sig)
             except ProcessLookupError:
-                return True
+                return True                     # 组已经没了
             except Exception as e:
                 logger.error(f"killpg 失败: {simulation_id}, pgid={pgid}, error={e}")
                 return False
 
-            deadline = time.time() + (timeout if sig is signal.SIGTERM else 3)
+            deadline = time.time() + wait
             while time.time() < deadline:
-                # 只有确认死亡（或确认换成了别的进程）才算终止成功。
-                # PID_UNKNOWN 表示身份读不出来了，进程可能还活着，不能当成功。
-                if cls._probe_pid(pid, simulation_id) in (cls.PID_DEAD, cls.PID_OTHER):
+                if not cls._process_group_alive(pgid):
                     return True
                 time.sleep(0.2)
+            logger.warning(
+                f"进程组 {pgid} 在 {sig.name} 后 {wait}s 内仍存活: {simulation_id}"
+            )
 
-        return cls._probe_pid(pid, simulation_id) in (cls.PID_DEAD, cls.PID_OTHER)
+        return not cls._process_group_alive(pgid)
 
     @classmethod
     def forget_simulation(cls, simulation_id: str, join_timeout: float = 5.0):
