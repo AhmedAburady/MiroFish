@@ -1717,7 +1717,7 @@ Requirements:
 2. Point out where they agree and where they disagree
 3. Highlight the quotes worth keeping
 4. Stay objective and neutral; favour no side
-5. Keep it under about 700 words
+5. Keep it under about 450 words
 
 Formatting constraints (must be followed):
 - Plain text paragraphs, separated by blank lines
@@ -1742,7 +1742,9 @@ Write the interview summary."""
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0.3,
-                max_tokens=800
+                # ~450 英文单词约 600 token，留出余量避免摘要被截断。
+                # 提示词里的字数上限必须和这里保持一致。
+                max_tokens=900
             )
             return summary
             

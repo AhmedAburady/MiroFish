@@ -228,6 +228,54 @@ class SimulationRunner:
     _graph_memory_enabled: Dict[str, bool] = {}  # simulation_id -> enabled
     
     @classmethod
+    def forget_simulation(cls, simulation_id: str, join_timeout: float = 5.0) -> list:
+        """让 Runner 彻底忘记一个模拟，用于删除前的静默处理。
+
+        必须在 rmtree 之前调用：监控线程会调用 _save_run_state()，而后者是
+        os.makedirs(exist_ok=True) + 写文件，会把刚刚删掉的目录再造出来。
+
+        返回警告列表（join 超时、句柄关闭失败等），不抛异常。
+        """
+        warnings = []
+
+        # 先等监控线程退出，它是唯一会写 run_state.json 的后台线程
+        thread = cls._monitor_threads.pop(simulation_id, None)
+        if thread and thread.is_alive():
+            thread.join(timeout=join_timeout)
+            if thread.is_alive():
+                warnings.append(
+                    f"监控线程在 {join_timeout}s 内未退出: {simulation_id}，"
+                    f"它可能会重建已删除的目录"
+                )
+
+        for name, handles in (('stdout', cls._stdout_files), ('stderr', cls._stderr_files)):
+            fh = handles.pop(simulation_id, None)
+            if fh:
+                try:
+                    fh.close()
+                except Exception as e:
+                    warnings.append(f"关闭 {name} 句柄失败: {e}")
+
+        # 清掉所有按 simulation_id 索引的缓存，否则 /run-status 会返回
+        # 已删除模拟的陈旧数据，直到进程重启
+        cls._run_states.pop(simulation_id, None)
+        cls._processes.pop(simulation_id, None)
+        cls._action_queues.pop(simulation_id, None)
+        cls._graph_memory_enabled.pop(simulation_id, None)
+
+        return warnings
+
+    @classmethod
+    def has_live_process(cls, simulation_id: str) -> bool:
+        """该模拟是否真的还有一个活着的子进程。
+
+        run_state.json 里的 STARTING 可能是上次进程被强杀留下的残留状态，
+        此时 _processes 是空的，不能据此永远拒绝删除。
+        """
+        process = cls._processes.get(simulation_id)
+        return process is not None and process.poll() is None
+
+    @classmethod
     def get_run_state(cls, simulation_id: str) -> Optional[SimulationRunState]:
         """获取运行状态"""
         if simulation_id in cls._run_states:
