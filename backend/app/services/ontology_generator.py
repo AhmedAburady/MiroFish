@@ -121,7 +121,9 @@ B. **Specific types (8, designed from the text content)**:
 
 - Count: 6-10
 - Relationships should reflect real connections in social-media interaction
-- Make sure source_targets covers the entity types you defined
+- Each relationship must list **at most 10** source_targets pairs. Do not
+  enumerate every possible combination of entity types. Pick the pairs that
+  actually matter for the relationship.
 
 ### 3. Attribute design
 
@@ -323,6 +325,25 @@ Based on the above, design the entity types and relationship types for a social 
                     st["target"] = entity_name_map[st["target"]]
             if "source_targets" not in edge:
                 edge["source_targets"] = []
+            # Zep 硬性限制：source_targets 最多 10 项，超出会返回
+            # 400 "source_targets cannot contain more than 10 items (max)"。
+            # LLM 经常为像 RESPONDS_TO 这样的通用关系穷举所有实体组合，
+            # 所以必须在代码里去重并截断，不能只靠提示词。
+            seen = set()
+            deduped = []
+            for st in edge["source_targets"]:
+                key = (st.get("source"), st.get("target"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(st)
+            if len(deduped) > MAX_SOURCE_TARGETS:
+                logger.warning(
+                    f"Edge type '{edge.get('name')}' has {len(deduped)} source_targets, "
+                    f"truncating to {MAX_SOURCE_TARGETS} (Zep limit)"
+                )
+                deduped = deduped[:MAX_SOURCE_TARGETS]
+            edge["source_targets"] = deduped
             if "attributes" not in edge:
                 edge["attributes"] = []
             if len(edge.get("description", "")) > 100:
@@ -331,6 +352,7 @@ Based on the above, design the entity types and relationship types for a social 
         # Zep API 限制：最多 10 个自定义实体类型，最多 10 个自定义边类型
         MAX_ENTITY_TYPES = 10
         MAX_EDGE_TYPES = 10
+        MAX_SOURCE_TARGETS = 10   # Zep API 上限
 
         # 去重：按 name 去重，保留首次出现的
         seen_names = set()
